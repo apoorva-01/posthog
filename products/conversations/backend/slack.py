@@ -675,6 +675,13 @@ def handle_support_message(event: dict, team: Team, slack_team_id: str) -> None:
     if not channel:
         return
 
+    # An edit arrives as its own message_changed event, which the allowlist below drops. We
+    # can't patch the ticket in place (ticket messages aren't keyed by the source Slack ts),
+    # so note the edit privately and stop.
+    if event.get("subtype") == "message_changed":
+        _note_slack_reply_edited(event, team, channel)
+        return
+
     is_bot = bool(event.get("bot_id") or event.get("subtype") == "bot_message")
 
     # Only real user content opens or updates a ticket; system-message subtypes are noise.
@@ -781,6 +788,63 @@ def handle_support_message(event: dict, team: Team, slack_team_id: str) -> None:
         is_thread_reply=False,
         slack_team_id=slack_team_id,
         channel_detail=ChannelDetail.SLACK_CHANNEL_MESSAGE,
+    )
+
+
+def _note_slack_reply_edited(event: dict, team: Team, channel: str) -> None:
+    """Post a private note when a synced Slack message is edited.
+
+    Slack delivers an edit as a message_changed event whose real content sits under
+    ``message`` (its ``ts`` is the original message's, so it still maps to the thread).
+    We don't rewrite the ticket message the edit belongs to (nothing stores the source
+    Slack ts to match against), so the note points the teammate at the Slack thread for
+    the current text.
+    """
+    edited_message = event.get("message") or {}
+
+    # Only genuine user edits carry an ``edited`` object. Slack also fires message_changed
+    # for link unfurls and similar, which we don't surface. Edits to a bot's own messages
+    # (e.g. our ticket-created confirmation) aren't customer replies either.
+    if not edited_message.get("edited"):
+        return
+    if edited_message.get("bot_id") or edited_message.get("subtype") == "bot_message":
+        return
+
+    thread_ts = edited_message.get("thread_ts") or edited_message.get("ts")
+    if not thread_ts:
+        return
+
+    ticket = Ticket.objects.filter(team=team, slack_channel_id=channel, slack_thread_ts=thread_ts).first()
+    if not ticket:
+        return
+
+    message_ts = edited_message.get("ts") or ""
+    edit_ts = (edited_message.get("edited") or {}).get("ts") or ""
+    dedupe_key = f"slack_reply_edited:{message_ts}:{edit_ts}"
+    already_noted = Comment.objects.filter(
+        team=team,
+        scope="conversations_ticket",
+        item_id=str(ticket.id),
+        item_context__internal_note_key=dedupe_key,
+        deleted=False,
+    ).exists()
+    if already_noted:
+        return
+
+    Comment.objects.create(
+        team=team,
+        scope="conversations_ticket",
+        item_id=str(ticket.id),
+        content=(
+            "A reply in the linked Slack thread was edited after it synced to this ticket. "
+            "The ticket still shows the original text, so open the Slack thread to see the current version."
+        ),
+        item_context={
+            "author_type": "support",
+            "is_private": True,
+            "from_slack": True,
+            "internal_note_key": dedupe_key,
+        },
     )
 
 

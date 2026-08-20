@@ -10,6 +10,7 @@ from django.test import override_settings
 from celery.exceptions import MaxRetriesExceededError, Retry
 from parameterized import parameterized
 
+from posthog.models.comment import Comment
 from posthog.models.team.extensions import get_or_create_team_extension
 
 from products.conversations.backend.cache import is_nudge_suppressed
@@ -88,6 +89,96 @@ class TestSlackMessageRouting(BaseTest):
         )
 
         mock_create_or_update.assert_not_called()
+
+    def _message_changed_event(
+        self, *, channel="C_OTHER", thread_ts="1699999999.000000", edited=True, extra_message=None
+    ):
+        # Shape per Slack's message_changed docs: the edited content sits under "message",
+        # whose "ts" is the original message's, and a real user edit carries an "edited" object.
+        message = {
+            "type": "message",
+            "user": "U123",
+            "text": "Edited reply text",
+            "ts": "1700000000.000100",
+            "thread_ts": thread_ts,
+        }
+        if edited:
+            message["edited"] = {"user": "U123", "ts": "1700000000.000290"}
+        if extra_message:
+            message.update(extra_message)
+        return {
+            "type": "message",
+            "subtype": "message_changed",
+            "hidden": True,
+            "channel": channel,
+            "ts": "1700000000.000300",
+            "message": message,
+        }
+
+    def _private_notes(self):
+        return Comment.objects.filter(
+            team=self.team,
+            scope="conversations_ticket",
+            item_context__is_private=True,
+        )
+
+    def test_message_changed_posts_private_edit_note(self):
+        ticket = Ticket.objects.create_with_number(
+            team=self.team,
+            channel_source=Channel.SLACK,
+            widget_session_id="",
+            distinct_id="",
+            slack_channel_id="C_OTHER",
+            slack_thread_ts="1699999999.000000",
+        )
+
+        handle_support_message(self._message_changed_event(), self.team, "T123")
+
+        notes = self._private_notes()
+        assert notes.count() == 1
+        note = notes.first()
+        assert note.item_id == str(ticket.id)
+        assert note.item_context["author_type"] == "support"
+        assert "edited" in note.content
+        assert "Slack thread" in note.content
+
+    @parameterized.expand(
+        [
+            ("link_unfurl_without_edited_field", {"edited": False}, True),
+            ("no_ticket_bound_to_thread", {}, False),
+            ("bot_edits_its_own_message", {"extra_message": {"bot_id": "B999"}}, True),
+        ]
+    )
+    def test_message_changed_does_not_note(self, _name, event_kwargs, create_ticket):
+        if create_ticket:
+            Ticket.objects.create_with_number(
+                team=self.team,
+                channel_source=Channel.SLACK,
+                widget_session_id="",
+                distinct_id="",
+                slack_channel_id="C_OTHER",
+                slack_thread_ts="1699999999.000000",
+            )
+
+        handle_support_message(self._message_changed_event(**event_kwargs), self.team, "T123")
+
+        assert self._private_notes().count() == 0
+
+    def test_message_changed_note_is_deduped_on_redelivery(self):
+        Ticket.objects.create_with_number(
+            team=self.team,
+            channel_source=Channel.SLACK,
+            widget_session_id="",
+            distinct_id="",
+            slack_channel_id="C_OTHER",
+            slack_thread_ts="1699999999.000000",
+        )
+        event = self._message_changed_event()
+
+        handle_support_message(event, self.team, "T123")
+        handle_support_message(event, self.team, "T123")
+
+        assert self._private_notes().count() == 1
 
     @patch("products.conversations.backend.slack.get_slack_client")
     @patch("products.conversations.backend.slack.create_or_update_slack_ticket")
